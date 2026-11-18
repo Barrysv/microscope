@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>USB Microscope Viewer</title>
+<style>
+  :root { --bg:#111418; --panel:#1c2128; --line:#2d343d; --text:#e6e9ee; --muted:#9aa4b1; --accent:#3fa7ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0 12px 0 0; font-weight:600; }
+  select, button, input[type=text] { background:#262c35; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font-size:14px; }
+  button { cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.on { background:var(--accent); color:#000; border-color:var(--accent); }
+  label { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+  main { flex:1; display:flex; min-height:0; }
+  #stage { flex:1; position:relative; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#000; }
+  #view { position:relative; }
+  video, #frozen { display:block; max-width:100%; max-height:100%; }
+  #frozen { display:none; }
+  #overlay { position:absolute; inset:0; pointer-events:none; }
+  #msg { position:absolute; color:var(--muted); text-align:center; padding:20px; max-width:520px; line-height:1.5; }
+  #badge { position:absolute; top:10px; left:10px; background:#c62828; color:#fff; font-size:12px; font-weight:700; padding:3px 8px; border-radius:4px; display:none; }
+  aside { width:220px; background:var(--panel); border-left:1px solid var(--line); overflow-y:auto; padding:10px; }
+  aside h2 { font-size:13px; color:var(--muted); margin:0 0 8px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
+  .shot { margin-bottom:10px; }
+  .shot img { width:100%; border-radius:4px; border:1px solid var(--line); cursor:pointer; }
+  .shot div { font-size:11px; color:var(--muted); display:flex; justify-content:space-between; margin-top:2px; }
+  .shot a { color:var(--accent); text-decoration:none; }
+  .sep { width:1px; height:24px; background:var(--line); }
+  @media (max-width:800px){ aside{ display:none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔬 Microscope Viewer</h1>
+  <select id="camSel" title="Camera"><option>Click Start…</option></select>
+  <select id="resSel" title="Resolution">
+    <option value="640x480">640×480</option>
+    <option value="1280x720" selected>1280×720</option>
+    <option value="1920x1080">1920×1080</option>
+    <option value="2592x1944">2592×1944 (5 MP)</option>
+  </select>
+  <button id="startBtn">▶ Start</button>
+  <span class="sep"></span>
+  <button id="freezeBtn" title="Space bar">⏸ Freeze</button>
+  <button id="snapBtn" title="S key">📷 Snapshot</button>
+  <span class="sep"></span>
+  <button id="flipH" title="Mirror left–right">⇋</button>
+  <button id="flipV" title="Flip up–down">⇵</button>
+  <button id="rotBtn" title="Rotate 90°">⟳</button>
+  <label>Zoom <input id="zoom" type="range" min="1" max="4" step="0.1" value="1"></label>
+  <span class="sep"></span>
+  <button id="gridBtn">Grid</button>
+  <button id="crossBtn">Crosshair</button>
+  <input id="label" type="text" placeholder="Label (e.g. onion cells 40×)" size="22">
+  <button id="fsBtn" title="F key">⛶ Full screen</button>
+</header>
+<main>
+  <div id="stage">
+    <div id="msg">Plug in the microscope, then click <b>▶ Start</b> and allow camera access.<br><br>
+      If the wrong camera appears (e.g. the laptop's own webcam), choose the microscope from the drop-down.</div>
+    <div id="view">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="frozen"></canvas>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="badge">FROZEN</div>
+  </div>
+  <aside>
+    <h2>Snapshots</h2>
+    <div id="gallery"><div style="font-size:12px;color:var(--muted)">None yet. Snapshots are kept only until the page is closed — click “save” to download.</div></div>
+  </aside>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), frozen = $('frozen'), overlay = $('overlay'), view = $('view'), stage = $('stage');
+let stream = null, isFrozen = false, flipH = false, flipV = false, rot = 0, zoom = 1, grid = false, cross = false, shots = 0;
+
+async function listCams(selectedId) {
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const sel = $('camSel'); sel.innerHTML = '';
+  devs.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId; o.textContent = d.label || ('Camera ' + (i + 1));
+    sel.appendChild(o);
+  });
+  if (selectedId) sel.value = selectedId;
+  return devs;
+}
+
+async function start(deviceId) {
+  if (!navigator.mediaDevices?.getUserMedia) { showMsg('This browser cannot access cameras. Try Chrome or Edge.'); return; }
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  const [w, h] = $('resSel').value.split('x').map(Number);
+  const c = { width: { ideal: w }, height: { ideal: h } };
+  if (deviceId) c.deviceId = { exact: deviceId };
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: c, audio: false });
+  } catch (e) {
+    showMsg('Could not open the camera: ' + e.name + '.<br><br>' +
+      (e.name === 'NotAllowedError' ? 'Camera permission was blocked. Click the camera icon in the address bar and allow access, then try again.' :
+       e.name === 'NotReadableError' ? 'Another app (Teams, Camera, Zoom…) may be using it. Close that app and try again.' :
+       e.name === 'NotFoundError' ? 'No camera found. Check the USB cable and try another port.' : e.message));
+    return;
+  }
+  video.srcObject = stream;
+  const track = stream.getVideoTracks()[0];
+  const devs = await listCams(track.getSettings().deviceId);
+  // On first start, prefer a camera that isn't the built-in webcam
+  if (!deviceId && devs.length > 1) {
+    const micro = devs.find(d => /micro|usb|uvc|digital/i.test(d.label) && !/integrated|built-in|facetime|front|hd webcam/i.test(d.label));
+    if (micro && micro.deviceId !== track.getSettings().deviceId) return start(micro.deviceId);
+  }
+  $('msg').style.display = 'none';
+  setFrozen(false);
+  $('startBtn').textContent = '↻ Restart';
+}
+
+function showMsg(html) { $('msg').innerHTML = html; $('msg').style.display = 'block'; }
+
+function applyTransform() {
+  const sx = (flipH ? -1 : 1) * zoom, sy = (flipV ? -1 : 1) * zoom;
+  const t = `rotate(${rot}deg) scale(${sx}, ${sy})`;
+  video.style.transform = t; frozen.style.transform = t;
+  drawOverlay();
+}
+
+// Render the current (transformed, zoomed) view into a canvas
+function captureCanvas() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const swap = rot % 180 !== 0;
+  const c = document.createElement('canvas');
+  c.width = swap ? vh : vw; c.height = swap ? vw : vh;
+  const g = c.getContext('2d');
+  g.translate(c.width / 2, c.height / 2);
+  g.rotate(rot * Math.PI / 180);
+  g.scale((flipH ? -1 : 1) * zoom, (flipV ? -1 : 1) * zoom);
+  g.drawImage(isFrozen ? frozen._raw : video, -vw / 2, -vh / 2, vw, vh);
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  drawGuides(g, c.width, c.height);
+  const text = [$('label').value.trim(), new Date().toLocaleString('en-AU')].filter(Boolean).join('  •  ');
+  const fs = Math.max(14, Math.round(c.width / 50));
+  g.font = `600 ${fs}px system-ui, sans-serif`;
+  const tw = g.measureText(text).width;
+  g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(0, c.height - fs * 1.8, tw + fs * 1.2, fs * 1.8);
+  g.fillStyle = '#fff'; g.fillText(text, fs * 0.6, c.height - fs * 0.55);
+  return c;
+}
+
+function setFrozen(f) {
+  isFrozen = f;
+  if (f && video.videoWidth) {
+    const raw = document.createElement('canvas');
+    raw.width = video.videoWidth; raw.height = video.videoHeight;
+    raw.getContext('2d').drawImage(video, 0, 0);
+    frozen._raw = raw;
+    frozen.width = raw.width; frozen.height = raw.height;
+    frozen.getContext('2d').drawImage(raw, 0, 0);
+    frozen.style.display = 'block'; video.style.display = 'none';
+  } else {
+    isFrozen = false; frozen.style.display = 'none'; video.style.display = 'block';
+  }
+  $('badge').style.display = isFrozen ? 'block' : 'none';
+  $('freezeBtn').textContent = isFrozen ? '▶ Live' : '⏸ Freeze';
+  $('freezeBtn').classList.toggle('on', isFrozen);
+}
+
+function snapshot() {
+  if (!video.videoWidth) return;
+  const c = captureCanvas();
+  const url = c.toDataURL('image/png');
+  const n = ++shots;
+  const name = (($('label').value.trim() || 'microscope').replace(/[^\w\- ]+/g, '').replace(/\s+/g, '_')) + '_' + n + '.png';
+  const g = $('gallery'); if (n === 1) g.innerHTML = '';
+  const d = document.createElement('div'); d.className = 'shot';
+  d.innerHTML = `<img src="${url}" title="Click to open full size"><div><span>#${n}</span><a href="${url}" download="${name}">save</a></div>`;
+  d.querySelector('img').onclick = () => { const w = window.open(); w.document.write(`<img src="${url}" style="max-width:100%">`); };
+  g.prepend(d);
+  stage.animate([{ background: '#fff' }, { background: '#000' }], 200);
+}
+
+function drawGuides(g, w, h) {
+  g.save();
+  if (grid) {
+    g.strokeStyle = 'rgba(255,255,0,.45)'; g.lineWidth = Math.max(1, w / 900);
+    const step = Math.min(w, h) / 10;
+    for (let x = w / 2 % step; x < w; x += step) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke(); }
+    for (let y = h / 2 % step; y < h; y += step) { g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); }
+  }
+  if (cross) {
+    g.strokeStyle = 'rgba(255,60,60,.9)'; g.lineWidth = Math.max(2, w / 600);
+    const s = Math.min(w, h) / 12;
+    g.beginPath(); g.moveTo(w / 2 - s, h / 2); g.lineTo(w / 2 + s, h / 2); g.moveTo(w / 2, h / 2 - s); g.lineTo(w / 2, h / 2 + s); g.stroke();
+    g.beginPath(); g.arc(w / 2, h / 2, s * 0.5, 0, Math.PI * 2); g.stroke();
+  }
+  g.restore();
+}
+
+function drawOverlay() {
+  const r = (isFrozen ? frozen : video).getBoundingClientRect(), vr = view.getBoundingClientRect();
+  overlay.width = vr.width; overlay.height = vr.height;
+  const g = overlay.getContext('2d'); g.clearRect(0, 0, overlay.width, overlay.height);
+  drawGuides(g, overlay.width, overlay.height);
+}
+
+// Controls
+$('startBtn').onclick = () => start($('camSel').value && $('camSel').value !== 'Click Start…' ? $('camSel').value : undefined);
+$('camSel').onchange = () => start($('camSel').value);
+$('resSel').onchange = () => stream && start($('camSel').value);
+$('freezeBtn').onclick = () => setFrozen(!isFrozen);
+$('snapBtn').onclick = snapshot;
+$('flipH').onclick = () => { flipH = !flipH; $('flipH').classList.toggle('on', flipH); applyTransform(); };
+$('flipV').onclick = () => { flipV = !flipV; $('flipV').classList.toggle('on', flipV); applyTransform(); };
+$('rotBtn').onclick = () => { rot = (rot + 90) % 360; applyTransform(); };
+$('zoom').oninput = e => { zoom = +e.target.value; applyTransform(); };
+$('gridBtn').onclick = () => { grid = !grid; $('gridBtn').classList.toggle('on', grid); drawOverlay(); };
+$('crossBtn').onclick = () => { cross = !cross; $('crossBtn').classList.toggle('on', cross); drawOverlay(); };
+$('fsBtn').onclick = () => document.fullscreenElement ? document.exitFullscreen() : stage.requestFullscreen();
+video.addEventListener('loadedmetadata', drawOverlay);
+window.addEventListener('resize', drawOverlay);
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
+  if (e.code === 'Space') { e.preventDefault(); setFrozen(!isFrozen); }
+  else if (e.key === 's' || e.key === 'S') snapshot();
+  else if (e.key === 'f' || e.key === 'F') $('fsBtn').click();
+});
+navigator.mediaDevices?.addEventListener?.('devicechange', () => listCams($('camSel').value));
+</script>
+</body>
+</html>
